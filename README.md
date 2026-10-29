@@ -145,7 +145,7 @@ cd sdk/typescript && npm run typecheck && npm run example   # needs a running se
 
 ## Used by
 
-**[Kiln ERP](../erp)** is a Next.js 16 + PostgreSQL ERP that uses emberkv in production style through the TypeScript SDK. It stores sessions (token hashes only), login rate limits, exactly-once form submissions (`If-None-Match: *`), document edit leases with heartbeats, and a shared dashboard cache, each with a designed fallback for when emberkv is unavailable. Its System page shows live engine statistics, and its integration tests run against a real `emberkv-server`. See its [ADR on the emberkv boundary](../erp/docs/adr/0002-emberkv-boundary.md).
+**[Kiln ERP](https://github.com/dimasmuly/kiln-erp)** is a Next.js 16 + PostgreSQL ERP that uses emberkv in production style through the TypeScript SDK. It stores sessions (token hashes only), login rate limits, exactly-once form submissions (`If-None-Match: *`), document edit leases with heartbeats, and a shared dashboard cache, each with a designed fallback for when emberkv is unavailable. Its System page shows live engine statistics, and its integration tests run against a real `emberkv-server`. See its [ADR on the emberkv boundary](https://github.com/dimasmuly/kiln-erp/blob/main/docs/adr/0002-emberkv-boundary.md).
 
 ## Limitations & roadmap
 
