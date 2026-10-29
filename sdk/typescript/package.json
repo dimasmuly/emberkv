@@ -1,0 +1,19 @@
+{
+  "name": "@emberkv/client",
+  "version": "0.2.0",
+  "description": "Zero-dependency TypeScript client for the emberkv HTTP API",
+  "license": "MIT",
+  "type": "module",
+  "exports": "./src/index.ts",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "example": "node examples/app-backend.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.9.0"
+  }
+}

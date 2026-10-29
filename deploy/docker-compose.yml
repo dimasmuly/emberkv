@@ -1,0 +1,38 @@
+# emberkv next to your application backend.
+#
+#   1. ekv token --name app-backend --access read_write \
+#        --namespaces sessions,otp,limits,idempotency,flags
+#   2. Put the printed [[key]] block into deploy/auth.toml (see auth.example.toml)
+#      and the token into your backend's secrets as EMBERKV_TOKEN.
+#   3. docker compose -f deploy/docker-compose.yml up -d
+#
+# emberkv has no in-process TLS: keep it on this private network and let only
+# your backend reach it. Do not publish port 8080 to the internet.
+
+services:
+  emberkv:
+    build: ..
+    restart: unless-stopped
+    environment:
+      EMBERKV_AUTH_FILE: /etc/emberkv/auth.toml
+      EMBERKV_BACKUP_DIR: /backups
+      EMBERKV_SYNC: periodic          # "always" for zero loss on power failure
+      EMBERKV_LOG_FORMAT: json
+    volumes:
+      - emberkv-data:/data
+      - emberkv-backups:/backups
+      - ./auth.toml:/etc/emberkv/auth.toml:ro
+    expose: ["8080", "7878", "9464"] # reachable by other services, not the host
+    stop_grace_period: 30s            # > EMBERKV_SHUTDOWN_GRACE_SECS (15s)
+
+  # Your backend, for illustration:
+  # api:
+  #   image: my-company/api
+  #   environment:
+  #     EMBERKV_URL: http://emberkv:8080
+  #     EMBERKV_TOKEN: ${EMBERKV_TOKEN}
+  #   depends_on: [emberkv]
+
+volumes:
+  emberkv-data:
+  emberkv-backups:

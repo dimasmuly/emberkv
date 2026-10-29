@@ -1,0 +1,21 @@
+[package]
+name = "emberkv-client"
+description = "Async Rust client for the emberkv server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+bytes.workspace = true
+emberkv-protocol.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "time"] }
+tokio-util.workspace = true
+
+[lints]
+workspace = true

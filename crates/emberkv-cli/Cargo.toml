@@ -1,0 +1,27 @@
+[package]
+name = "emberkv-cli"
+description = "Command-line client and load generator for emberkv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "ekv"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+emberkv-client.workspace = true
+getrandom.workspace = true
+hdrhistogram.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

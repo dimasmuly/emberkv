@@ -1,0 +1,44 @@
+[package]
+name = "emberkv-server"
+description = "TCP server for the emberkv key-value store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "emberkv-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+bytes.workspace = true
+clap.workspace = true
+emberkv-engine.workspace = true
+emberkv-protocol.workspace = true
+futures.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+emberkv-client.workspace = true
+reqwest.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

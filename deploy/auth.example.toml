@@ -1,0 +1,14 @@
+# Copy to auth.toml and replace the hashes with output from `ekv token`.
+# Only SHA-256 hashes go here; the tokens themselves live in your secret manager.
+
+[[key]]
+name = "app-backend"
+token_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+access = "read_write"
+namespaces = ["sessions", "otp", "limits", "idempotency", "flags"]
+
+[[key]]
+name = "ops"
+token_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+access = "admin"
+namespaces = ["*"]

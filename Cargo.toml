@@ -1,0 +1,66 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+repository = "https://github.com/dimasmuly/emberkv"
+keywords = ["database", "key-value", "storage", "bitcask"]
+categories = ["database-implementations"]
+
+[workspace.dependencies]
+emberkv-engine = { path = "crates/emberkv-engine", version = "0.1.0" }
+emberkv-protocol = { path = "crates/emberkv-protocol", version = "0.1.0" }
+emberkv-client = { path = "crates/emberkv-client", version = "0.1.0" }
+emberkv-server = { path = "crates/emberkv-server", version = "0.1.0" }
+
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
+clap = { version = "4", features = ["derive", "env"] }
+crc32fast = "1"
+criterion = "0.5"
+futures = "0.3"
+getrandom = "0.3"
+hdrhistogram = { version = "7", default-features = false }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+parking_lot = "0.12"
+proptest = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time", "io-util"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+toml = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["request-id", "timeout", "trace", "util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+needless_pass_by_value = "warn"
+redundant_clone = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+
+[profile.bench]
+inherits = "release"
