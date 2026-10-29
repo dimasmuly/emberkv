@@ -13,7 +13,8 @@
 //! * **Compaction** rewrites live records from sealed segments into a fresh
 //!   segment while reads and writes continue, and is crash-safe at every step.
 //! * **TTL**: keys can expire; expired data is dropped by compaction.
-//! * **Atomic batches** and **atomic read-modify-write** ([`Engine::update`]).
+//! * **Atomic batches**, **atomic read-modify-write** ([`Engine::update`]) and
+//!   multi-key **transactions** ([`Engine::transaction`]).
 //! * **Checkpoints**: consistent, near-instant backups via hard links.
 //!
 //! See `docs/ARCHITECTURE.md` in the repository for the full design.
@@ -53,7 +54,7 @@ mod types;
 
 pub use batch::WriteBatch;
 pub use clock::{Clock, ManualClock, SystemClock};
-pub use engine::{Engine, prefix_upper_bound};
+pub use engine::{Engine, Transaction, prefix_upper_bound};
 pub use error::{Error, Result};
 pub use options::{Options, SyncPolicy};
 pub use record::{MAX_KEY_LEN, MAX_VALUE_LEN};

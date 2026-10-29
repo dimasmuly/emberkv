@@ -20,11 +20,14 @@ use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::auth::{Access, Authenticator, Principal};
+use crate::executor::Executor;
 pub(crate) use error::ApiError;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
+    /// For reads and admin operations; writes go through `executor`.
     pub(crate) engine: Engine,
+    pub(crate) executor: Executor,
     pub(crate) auth: Option<Arc<Authenticator>>,
     pub(crate) backup_dir: Option<PathBuf>,
     pub(crate) shutdown: CancellationToken,

@@ -85,3 +85,12 @@ impl From<EngineError> for ApiError {
         }
     }
 }
+
+impl From<crate::executor::ExecuteError> for ApiError {
+    fn from(err: crate::executor::ExecuteError) -> Self {
+        match err {
+            crate::executor::ExecuteError::Storage(err) => err.into(),
+            crate::executor::ExecuteError::Panicked => Self::internal(),
+        }
+    }
+}

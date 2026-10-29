@@ -7,17 +7,17 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
-use emberkv_engine::{Entry, Expiry, Mutation, WriteBatch, prefix_upper_bound};
+use emberkv_engine::prefix_upper_bound;
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::value::RawValue;
-use sha2::{Digest, Sha256};
 use tracing::error;
 
 use super::{ApiError, AppState, Caller};
 use crate::auth::Access;
 use crate::keyspace;
+use crate::state_machine::{BatchOp, Command, Condition, Outcome, etag};
 use crate::telemetry;
 
 const DEFAULT_PAGE_SIZE: u32 = 100;
@@ -40,6 +40,18 @@ async fn run<T: Send + 'static>(
     result
 }
 
+/// Hands a write to the executor (local engine or Raft) and records metrics.
+async fn write(state: &AppState, op: &'static str, command: Command) -> Result<Outcome, ApiError> {
+    let started = Instant::now();
+    let result = state.executor.execute(command).await.map_err(ApiError::from);
+    telemetry::record_request("http", op, result.is_err(), started.elapsed());
+    result
+}
+
+fn not_a_counter() -> ApiError {
+    ApiError::conflict("not_a_counter", "the key holds a non-integer value")
+}
+
 /// Validates the namespace and key, returning the engine key.
 fn target(namespace: &str, key: &str) -> Result<Vec<u8>, ApiError> {
     keyspace::validate_namespace(namespace).map_err(|msg| ApiError::bad_request("invalid_namespace", msg))?;
@@ -53,13 +65,14 @@ fn check_namespace(namespace: &str) -> Result<(), ApiError> {
     keyspace::validate_namespace(namespace).map_err(|msg| ApiError::bad_request("invalid_namespace", msg))
 }
 
-fn parse_ttl(ttl: Option<&str>) -> Result<Expiry, ApiError> {
-    match ttl {
-        None => Ok(Expiry::Never),
-        Some(text) => keyspace::parse_duration(text)
-            .map(Expiry::After)
-            .map_err(|msg| ApiError::bad_request("invalid_ttl", msg)),
-    }
+/// A TTL in milliseconds; relative, so it is resolved when the write applies.
+fn parse_ttl(ttl: Option<&str>) -> Result<Option<u64>, ApiError> {
+    ttl.map(|text| {
+        keyspace::parse_duration(text)
+            .map(|d| d.as_millis() as u64)
+            .map_err(|msg| ApiError::bad_request("invalid_ttl", msg))
+    })
+    .transpose()
 }
 
 fn parse_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, ApiError> {
@@ -79,24 +92,13 @@ fn json_value(bytes: Vec<u8>) -> Result<Box<RawValue>, Vec<u8>> {
     }
 }
 
-/// A strong validator derived from the value itself, so no version counter
-/// has to be stored: equal values have equal ETags.
-fn etag(value: &[u8]) -> String {
-    let digest = Sha256::digest(value);
-    let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
-    format!("\"{hex}\"")
-}
-
-/// Conditional-request headers for writes (RFC 9110 §13).
-enum Precondition {
-    /// `If-Match`: the current ETag must be one of these (or `*` = exists).
-    IfMatch(Vec<String>),
-    /// `If-None-Match: *`: the key must not exist (create-only).
-    IfNoneMatchAny,
-}
+/// Conditional-request headers for writes (RFC 9110 §13): `If-Match` (the
+/// current ETag must be one of these, or `*` = exists) and `If-None-Match: *`
+/// (the key must not exist).
+struct Precondition;
 
 impl Precondition {
-    fn from_headers(headers: &HeaderMap) -> Result<Option<Self>, ApiError> {
+    fn from_headers(headers: &HeaderMap) -> Result<Option<Condition>, ApiError> {
         let read =
             |name| {
                 headers.get(name).map(|v: &HeaderValue| v.to_str().map(str::trim)).transpose().map_err(|_| {
@@ -109,22 +111,13 @@ impl Precondition {
                 "send either If-Match or If-None-Match, not both",
             )),
             (Some(tags), None) => {
-                Ok(Some(Self::IfMatch(tags.split(',').map(|t| t.trim().to_owned()).collect())))
+                Ok(Some(Condition::IfMatch(tags.split(',').map(|t| t.trim().to_owned()).collect())))
             }
-            (None, Some("*")) => Ok(Some(Self::IfNoneMatchAny)),
+            (None, Some("*")) => Ok(Some(Condition::IfNoneMatch)),
             (None, Some(_)) => {
                 Err(ApiError::bad_request("invalid_header", "only `If-None-Match: *` is supported"))
             }
             (None, None) => Ok(None),
-        }
-    }
-
-    fn allows(&self, current: Option<&Entry>) -> bool {
-        match self {
-            Self::IfNoneMatchAny => current.is_none(),
-            Self::IfMatch(tags) => {
-                current.is_some_and(|entry| tags.iter().any(|tag| tag == "*" || *tag == etag(&entry.value)))
-            }
         }
     }
 }
@@ -192,24 +185,16 @@ pub(crate) async fn put_key(
     if !is_json(&body) {
         return Err(ApiError::bad_request("invalid_json", "the request body must be a JSON document"));
     }
-    let expiry = parse_ttl(params.ttl.as_deref())?;
-    let precondition = Precondition::from_headers(&headers)?;
+    let ttl_ms = parse_ttl(params.ttl.as_deref())?;
+    let condition = Precondition::from_headers(&headers)?;
     let value = body.to_vec();
     let tag = etag(&value);
-    let engine = state.engine;
-
-    run("put", move || match precondition {
-        None => Ok(engine.put_with_expiry(&storage_key, &value, expiry)?),
-        Some(precondition) => engine.update(&storage_key, |current| {
-            if precondition.allows(current) {
-                (Mutation::Put { value, expiry }, Ok(()))
-            } else {
-                (Mutation::Keep, Err(ApiError::precondition_failed()))
-            }
-        })?,
-    })
-    .await?;
-    Ok((StatusCode::NO_CONTENT, [(header::ETAG, tag)]).into_response())
+    let command = Command::Put { key: storage_key, value, ttl_ms, condition };
+    match write(&state, "put", command).await? {
+        Outcome::Written => Ok((StatusCode::NO_CONTENT, [(header::ETAG, tag)]).into_response()),
+        Outcome::PreconditionFailed => Err(ApiError::precondition_failed()),
+        other => Err(unexpected(&other)),
+    }
 }
 
 pub(crate) async fn delete_key(
@@ -220,28 +205,17 @@ pub(crate) async fn delete_key(
 ) -> Result<StatusCode, ApiError> {
     let storage_key = target(&namespace, &key)?;
     caller.require(&namespace, Access::ReadWrite)?;
-    let precondition = match Precondition::from_headers(&headers)? {
-        Some(Precondition::IfNoneMatchAny) => {
+    let condition = match Precondition::from_headers(&headers)? {
+        Some(Condition::IfNoneMatch) => {
             return Err(ApiError::bad_request("invalid_header", "If-None-Match is not supported on DELETE"));
         }
         other => other,
     };
-    let engine = state.engine;
-    let existed = run("delete", move || match precondition {
-        None => Ok(engine.delete(&storage_key)?),
-        Some(precondition) => engine.update(&storage_key, |current| {
-            if precondition.allows(current) {
-                (Mutation::Delete, Ok(true))
-            } else {
-                (Mutation::Keep, Err(ApiError::precondition_failed()))
-            }
-        })?,
-    })
-    .await?;
-    if existed {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(ApiError::not_found(format!("key {key:?} not found")))
+    match write(&state, "delete", Command::Delete { key: storage_key, condition }).await? {
+        Outcome::Deleted { existed: true } => Ok(StatusCode::NO_CONTENT),
+        Outcome::Deleted { existed: false } => Err(ApiError::not_found(format!("key {key:?} not found"))),
+        Outcome::PreconditionFailed => Err(ApiError::precondition_failed()),
+        other => Err(unexpected(&other)),
     }
 }
 
@@ -367,28 +341,29 @@ pub(crate) async fn batch(
         ));
     }
 
-    let mut batch = WriteBatch::new();
+    let mut ops = Vec::with_capacity(count);
     for (i, op) in request.operations.into_iter().enumerate() {
         let key = target(&namespace, &op.key)?;
         let invalid = |msg: &str| ApiError::bad_request("invalid_batch", format!("operation {i}: {msg}"));
         match op.op {
             BatchOpKind::Put => {
                 let value = op.value.ok_or_else(|| invalid("put requires a non-null `value`"))?;
-                let expiry = parse_ttl(op.ttl.as_deref())?;
-                batch.put_with_expiry(key, value.get().as_bytes(), expiry);
+                let ttl_ms = parse_ttl(op.ttl.as_deref())?;
+                ops.push(BatchOp { key, value: Some(value.get().as_bytes().to_vec()), ttl_ms });
             }
             BatchOpKind::Delete => {
                 if op.value.is_some() || op.ttl.is_some() {
                     return Err(invalid("delete takes no `value` or `ttl`"));
                 }
-                batch.delete(key);
+                ops.push(BatchOp { key, value: None, ttl_ms: None });
             }
         }
     }
 
-    let engine = state.engine;
-    run("batch", move || Ok(engine.write_batch(&batch)?)).await?;
-    Ok(Json(json!({ "applied": count })))
+    match write(&state, "batch", Command::Batch { ops }).await? {
+        Outcome::Written => Ok(Json(json!({ "applied": count }))),
+        other => Err(unexpected(&other)),
+    }
 }
 
 // ---------------------------------------------------------------- counters
@@ -406,10 +381,6 @@ impl Default for IncrementRequest {
     }
 }
 
-fn parse_counter<T: std::str::FromStr>(value: &[u8]) -> Option<T> {
-    std::str::from_utf8(value).ok()?.trim().parse().ok()
-}
-
 /// Atomically adds `by` to an integer counter, creating it at 0 if absent.
 /// `ttl` applies only when the counter is created.
 pub(crate) async fn increment(
@@ -422,39 +393,16 @@ pub(crate) async fn increment(
     caller.require(&namespace, Access::ReadWrite)?;
     let request: IncrementRequest =
         if body.is_empty() { IncrementRequest::default() } else { parse_body(&body)? };
-    let ttl = request.ttl.as_deref().map(keyspace::parse_duration).transpose();
-    let ttl = ttl.map_err(|msg| ApiError::bad_request("invalid_ttl", msg))?;
-
-    let engine = state.engine;
-    let (value, expires_at) = run("increment", move || {
-        engine.update(&storage_key, |current| {
-            let now = engine.now_ms();
-            let (count, expires_at) = match current {
-                None => (0, ttl.map(|ttl| now.saturating_add(ttl.as_millis() as u64))),
-                Some(entry) => match parse_counter::<i64>(&entry.value) {
-                    Some(count) => (count, entry.expires_at_ms),
-                    None => {
-                        let err = ApiError::conflict("not_a_counter", "the key holds a non-integer value");
-                        return (Mutation::Keep, Err(err));
-                    }
-                },
-            };
-            let Some(next) = count.checked_add(request.by) else {
-                return (
-                    Mutation::Keep,
-                    Err(ApiError::conflict("counter_overflow", "the counter would overflow")),
-                );
-            };
-            let expiry = match (current, expires_at) {
-                (Some(_), _) => Expiry::KeepExisting,
-                (None, Some(at)) => Expiry::AtUnixMs(at),
-                (None, None) => Expiry::Never,
-            };
-            (Mutation::Put { value: next.to_string().into_bytes(), expiry }, Ok((next, expires_at)))
-        })?
-    })
-    .await?;
-    Ok(Json(json!({ "value": value, "expires_at": expires_at })))
+    let ttl_ms = parse_ttl(request.ttl.as_deref())?;
+    let command = Command::Increment { key: storage_key, by: request.by, ttl_ms };
+    match write(&state, "increment", command).await? {
+        Outcome::Counter { value, expires_at } => {
+            Ok(Json(json!({ "value": value, "expires_at": expires_at })))
+        }
+        Outcome::NotACounter => Err(not_a_counter()),
+        Outcome::CounterOverflow => Err(ApiError::conflict("counter_overflow", "the counter would overflow")),
+        other => Err(unexpected(&other)),
+    }
 }
 
 #[derive(Deserialize)]
@@ -468,16 +416,6 @@ struct RateLimitRequest {
 
 fn one() -> u64 {
     1
-}
-
-#[derive(Serialize)]
-struct RateLimitDecision {
-    allowed: bool,
-    limit: u64,
-    remaining: u64,
-    reset_at: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    retry_after_ms: Option<u64>,
 }
 
 /// Fixed-window rate limiting: at most `limit` units of `cost` per `window`
@@ -499,44 +437,20 @@ pub(crate) async fn rate_limit(
         .map_err(|msg| ApiError::bad_request("invalid_window", msg))?
         .as_millis() as u64;
     let RateLimitRequest { limit, cost, .. } = request;
+    let command = Command::RateLimit { key: storage_key, limit, window_ms: window, cost };
+    match write(&state, "rate_limit", command).await? {
+        Outcome::RateLimit(decision) => {
+            serde_json::to_value(decision).map(Json).map_err(|_| ApiError::internal())
+        }
+        Outcome::NotACounter => Err(not_a_counter()),
+        other => Err(unexpected(&other)),
+    }
+}
 
-    let engine = state.engine;
-    let decision = run("rate_limit", move || {
-        engine.update(&storage_key, |current| {
-            let now = engine.now_ms();
-            let (used, reset_at) = match current {
-                None => (0, Some(now.saturating_add(window))),
-                Some(entry) => match parse_counter::<u64>(&entry.value) {
-                    Some(used) => (used, entry.expires_at_ms),
-                    None => {
-                        let err = ApiError::conflict("not_a_counter", "the key holds a non-integer value");
-                        return (Mutation::Keep, Err(err));
-                    }
-                },
-            };
-            let next = used.saturating_add(cost);
-            if next > limit {
-                let retry_after_ms = reset_at.map(|at| at.saturating_sub(now));
-                let remaining = limit.saturating_sub(used);
-                let denied = RateLimitDecision { allowed: false, limit, remaining, reset_at, retry_after_ms };
-                return (Mutation::Keep, Ok(denied));
-            }
-            let expiry = match (current, reset_at) {
-                (None, Some(at)) => Expiry::AtUnixMs(at),
-                _ => Expiry::KeepExisting,
-            };
-            let allowed = RateLimitDecision {
-                allowed: true,
-                limit,
-                remaining: limit - next,
-                reset_at,
-                retry_after_ms: None,
-            };
-            (Mutation::Put { value: next.to_string().into_bytes(), expiry }, Ok(allowed))
-        })?
-    })
-    .await?;
-    serde_json::to_value(decision).map(Json).map_err(|_| ApiError::internal())
+/// A command produced an outcome its handler does not expect: a bug.
+fn unexpected(outcome: &Outcome) -> ApiError {
+    error!(?outcome, "unexpected outcome for command");
+    ApiError::internal()
 }
 
 // ---------------------------------------------------------------- admin

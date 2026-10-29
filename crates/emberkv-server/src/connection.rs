@@ -14,6 +14,8 @@ use tracing::{debug, error};
 
 use crate::auth::Authenticator;
 use crate::config::ServerConfig;
+use crate::executor::{ExecuteError, Executor};
+use crate::state_machine::{Command, Outcome};
 use crate::telemetry;
 
 #[derive(Debug, Clone, Copy)]
@@ -46,6 +48,7 @@ impl From<&ServerConfig> for ConnectionSettings {
 pub(crate) async fn serve(
     stream: TcpStream,
     engine: Engine,
+    executor: Executor,
     auth: Option<Arc<Authenticator>>,
     shutdown: CancellationToken,
     settings: ConnectionSettings,
@@ -95,17 +98,37 @@ pub(crate) async fn serve(
             _ if !authenticated => {
                 Response::error(ErrorCode::Unauthorized, "send AUTH with an admin token first")
             }
-            request => handle(&engine, request, settings).await,
+            request => handle(&engine, &executor, request, settings).await,
         };
         framed.send(response).await?;
     }
 }
 
-async fn handle(engine: &Engine, request: Request, settings: ConnectionSettings) -> Response {
+async fn handle(
+    engine: &Engine,
+    executor: &Executor,
+    request: Request,
+    settings: ConnectionSettings,
+) -> Response {
     let op = request.op();
     let started = Instant::now();
     let response = match request {
         Request::Ping => Response::Pong,
+        // Writes go through the executor, like HTTP writes.
+        Request::Put { key, value } => {
+            let command =
+                Command::Put { key: key.to_vec(), value: value.to_vec(), ttl_ms: None, condition: None };
+            match executor.execute(command).await {
+                Ok(Outcome::Written) => Response::Ok,
+                other => write_error(other),
+            }
+        }
+        Request::Delete { key } => {
+            match executor.execute(Command::Delete { key: key.to_vec(), condition: None }).await {
+                Ok(Outcome::Deleted { existed }) => Response::Deleted(existed),
+                other => write_error(other),
+            }
+        }
         // Engine calls block on disk I/O (and possibly fsync), so they run on
         // the blocking pool instead of stalling an async worker thread.
         request => {
@@ -138,8 +161,9 @@ fn execute(engine: &Engine, request: Request, max_scan: u32) -> Response {
         // Handled by the connection loop before dispatch.
         Request::Auth { .. } => Ok(Response::error(ErrorCode::BadRequest, "unexpected AUTH")),
         Request::Get { key } => engine.get(&key).map(|value| Response::Value(value.map(Bytes::from))),
-        Request::Put { key, value } => engine.put(&key, &value).map(|()| Response::Ok),
-        Request::Delete { key } => engine.delete(&key).map(Response::Deleted),
+        Request::Put { .. } | Request::Delete { .. } => {
+            Ok(Response::error(ErrorCode::Internal, "write on the read path"))
+        }
         Request::Scan { prefix, limit } => {
             engine.scan_prefix(&prefix, limit.min(max_scan) as usize).map(|entries| {
                 Response::Entries(
@@ -158,6 +182,17 @@ fn execute(engine: &Engine, request: Request, max_scan: u32) -> Response {
         }
     };
     result.unwrap_or_else(storage_error)
+}
+
+fn write_error(result: Result<Outcome, ExecuteError>) -> Response {
+    match result {
+        Err(ExecuteError::Storage(err)) => storage_error(err),
+        Err(ExecuteError::Panicked) => Response::error(ErrorCode::Internal, "internal error"),
+        Ok(outcome) => {
+            error!(?outcome, "unexpected outcome for a binary-protocol write");
+            Response::error(ErrorCode::Internal, "internal error")
+        }
+    }
 }
 
 /// Client mistakes are reported verbatim; internal failures are logged with

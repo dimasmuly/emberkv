@@ -14,6 +14,7 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::config::{ServerConfig, SyncMode};
 use crate::connection::{self, ConnectionSettings};
+use crate::executor::Executor;
 use crate::http::{self, AppState, HttpLimits};
 use crate::maintenance;
 use crate::telemetry::ConnectionGauge;
@@ -99,6 +100,7 @@ impl Server {
         if let Some(http_listener) = http_listener {
             let state = AppState {
                 engine: engine.clone(),
+                executor: Executor::Standalone(engine.clone()),
                 auth: config.auth.clone(),
                 backup_dir: config.backup_dir.clone(),
                 shutdown: cancel.clone(),
@@ -148,6 +150,7 @@ impl Server {
             }
 
             let engine = engine.clone();
+            let executor = Executor::Standalone(engine.clone());
             let auth = config.auth.clone();
             let cancel = cancel.child_token();
             tasks.spawn(
@@ -155,7 +158,7 @@ impl Server {
                     let _permit = permit;
                     let _gauge = ConnectionGauge::open();
                     debug!("connection opened");
-                    match connection::serve(stream, engine, auth, cancel, settings).await {
+                    match connection::serve(stream, engine, executor, auth, cancel, settings).await {
                         Ok(()) => debug!("connection closed"),
                         Err(err) => debug!(error = %err, "connection closed with error"),
                     }

@@ -14,10 +14,14 @@
 pub mod auth;
 mod config;
 mod connection;
+mod executor;
 mod http;
 mod keyspace;
 mod maintenance;
+#[cfg_attr(not(test), allow(dead_code, unused_imports, reason = "wired into the server in the next step"))]
+mod replica;
 mod server;
+mod state_machine;
 pub mod telemetry;
 
 pub use config::{CompactionPolicy, ServerConfig, SyncMode};

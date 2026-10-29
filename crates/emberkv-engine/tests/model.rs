@@ -2,7 +2,8 @@
 //! with the same random operations and require that they never disagree.
 //!
 //! Operations cover every write path (put, put with TTL, delete, atomic
-//! batch, read-modify-write) plus time passing, purging, reopening and
+//! batch, read-modify-write, multi-key transactions, including aborted
+//! ones) plus time passing, purging, reopening and
 //! compaction. A `ManualClock` makes expiry deterministic. Tiny segments
 //! force constant rotation, so segment boundaries, recovery and compaction
 //! are exercised on almost every case.
@@ -24,10 +25,30 @@ enum Op {
     ScanPrefix(u8),
     Batch(Vec<(u8, Option<Vec<u8>>)>),
     Increment(u8),
+    Transaction(Vec<TxStep>, bool),
     Advance(u16),
     Purge,
     Reopen,
     Compact,
+}
+
+/// One step inside a transaction; the `bool` on `Op::Transaction` aborts it.
+#[derive(Debug, Clone)]
+enum TxStep {
+    Get(u8),
+    Put(u8, Vec<u8>, Option<u16>),
+    Delete(u8),
+    Increment(u8),
+}
+
+fn tx_step() -> impl Strategy<Value = TxStep> {
+    let key = || any::<u8>().prop_map(|k| k % 24);
+    prop_oneof![
+        key().prop_map(TxStep::Get),
+        (key(), value(), proptest::option::of(1u16..200)).prop_map(|(k, v, ttl)| TxStep::Put(k, v, ttl)),
+        key().prop_map(TxStep::Delete),
+        key().prop_map(TxStep::Increment),
+    ]
 }
 
 fn value() -> impl Strategy<Value = Vec<u8>> {
@@ -44,6 +65,7 @@ fn op() -> impl Strategy<Value = Op> {
         1 => (0u8..3).prop_map(Op::ScanPrefix),
         2 => vec((key(), proptest::option::of(value())), 1..6).prop_map(Op::Batch),
         2 => key().prop_map(Op::Increment),
+        2 => (vec(tx_step(), 1..8), any::<bool>()).prop_map(|(steps, abort)| Op::Transaction(steps, abort)),
         2 => (0u16..300).prop_map(Op::Advance),
         1 => Just(Op::Purge),
         1 => Just(Op::Reopen),
@@ -156,6 +178,42 @@ proptest! {
                     };
                     prop_assert_eq!(next, expected);
                     model.entries.insert(key(k), (expected.to_string().into_bytes(), expiry));
+                }
+                Op::Transaction(steps, abort) => {
+                    // The model applies the steps to a copy, kept only on commit.
+                    let mut staged = Model { entries: model.entries.clone() };
+                    let t = now();
+                    let result = engine.transaction(|tx| {
+                        assert_eq!(tx.now_ms(), t);
+                        for step in &steps {
+                            match step {
+                                TxStep::Get(k) => {
+                                    let expected = staged.get(&key(*k), t).map(|(v, _)| v.clone());
+                                    assert_eq!(tx.get(&key(*k))?.map(|e| e.value), expected);
+                                }
+                                TxStep::Put(k, v, ttl) => {
+                                    let expiry = ttl.map_or(Expiry::Never, |ms| Expiry::After(Duration::from_millis(ms.into())));
+                                    tx.put(&key(*k), v, expiry)?;
+                                    staged.entries.insert(key(*k), (v.clone(), ttl.map(|ms| t + u64::from(ms))));
+                                }
+                                TxStep::Delete(k) => {
+                                    assert_eq!(tx.delete(&key(*k))?, staged.remove(&key(*k), t));
+                                }
+                                TxStep::Increment(k) => {
+                                    let current = tx.get(&key(*k))?;
+                                    let next = current.map_or(0, |e| parse_counter(&e.value)) + 1;
+                                    tx.put(&key(*k), next.to_string().as_bytes(), Expiry::KeepExisting)?;
+                                    let expiry = staged.get(&key(*k), t).and_then(|(_, exp)| *exp);
+                                    staged.entries.insert(key(*k), (next.to_string().into_bytes(), expiry));
+                                }
+                            }
+                        }
+                        if abort { Err(emberkv_engine::Error::EmptyKey) } else { Ok(()) }
+                    });
+                    prop_assert_eq!(result.is_ok(), !abort);
+                    if !abort {
+                        model = staged;
+                    }
                 }
                 Op::Advance(ms) => clock.advance(Duration::from_millis(ms.into())),
                 Op::Purge => {

@@ -309,27 +309,87 @@ impl Engine {
             })
             .collect();
 
-        let mut lens = Vec::with_capacity(resolved.len());
-        let (segment, base) = inner.append(&mut writer, |buf| {
-            for (key, put) in &resolved {
-                let spec = match put {
-                    Some((value, expires_at)) => Spec::put(key, value, expiry_field(*expires_at)),
-                    None => Spec::delete(key),
-                };
-                lens.push(record::append(buf, &spec.in_batch()) as u32);
-            }
-            record::append_commit(buf, resolved.len() as u32);
-        })?;
+        inner.append_batch(&mut writer, resolved)
+    }
 
-        // One index lock for the whole batch: readers see all of it or none.
-        let mut index = inner.index.write();
-        let mut offset = base;
-        for ((key, put), len) in resolved.into_iter().zip(lens) {
-            let ptr = put.map(|(_, expires_at)| ValuePtr { segment, offset, len, expires_at });
-            inner.install(&mut index, key, ptr);
-            offset += u64::from(len);
+    /// Atomically reads and writes any number of keys: every write in `f`
+    /// becomes visible together, crash-safely, and no other write can
+    /// happen between `f`'s reads and its writes. It generalizes
+    /// [`update`](Engine::update) to several keys, for example "reserve
+    /// stock on three items or none".
+    ///
+    /// All reads and expiries inside `f` use one instant,
+    /// [`Transaction::now_ms`]. That instant is taken from the engine's
+    /// clock, so a replicated state machine can make it identical on every
+    /// replica by driving a [`ManualClock`](crate::ManualClock).
+    ///
+    /// If `f` returns an error, nothing is written. `f` runs under the writer
+    /// lock, so it must be quick and must not call this engine's write
+    /// methods (that would deadlock).
+    ///
+    /// ```
+    /// use emberkv_engine::{Engine, Expiry, Options};
+    ///
+    /// # fn main() -> emberkv_engine::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// let db = Engine::open(dir.path(), Options::default())?;
+    /// db.put(b"stock:a", b"2")?;
+    /// db.put(b"stock:b", b"0")?;
+    ///
+    /// // Reserve one of each, or nothing.
+    /// let reserved = db.transaction(|tx| {
+    ///     let mut levels = Vec::new();
+    ///     for key in [&b"stock:a"[..], b"stock:b"] {
+    ///         let n: u32 = tx.get(key)?.map_or(0, |e| String::from_utf8_lossy(&e.value).parse().unwrap_or(0));
+    ///         if n == 0 {
+    ///             return Ok(false);
+    ///         }
+    ///         levels.push((key, n - 1));
+    ///     }
+    ///     for (key, n) in levels {
+    ///         tx.put(key, n.to_string().as_bytes(), Expiry::KeepExisting)?;
+    ///     }
+    ///     Ok(true)
+    /// })?;
+    /// assert!(!reserved);
+    /// assert_eq!(db.get(b"stock:a")?.as_deref(), Some(&b"2"[..]));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn transaction<T>(&self, f: impl FnOnce(&mut Transaction<'_>) -> Result<T>) -> Result<T> {
+        let inner = &*self.inner;
+        let mut writer = inner.writer.lock();
+        inner.check_writable()?;
+        let mut tx = Transaction { inner, now: self.now_ms(), writes: BTreeMap::new() };
+        let output = f(&mut tx)?;
+        let Transaction { now, mut writes, .. } = tx;
+        if writes.len() <= 1 {
+            // A single record is atomic on its own; skip the batch framing.
+            if let Some((key, put)) = writes.pop_first() {
+                match put {
+                    Some((value, expires_at)) => {
+                        inner.put_locked(&mut writer, &key, &value, Expiry::AtUnixMs(expires_at), now)?;
+                    }
+                    None => {
+                        inner.delete_locked(&mut writer, &key, now)?;
+                    }
+                }
+            }
+            return Ok(output);
         }
-        Ok(())
+        let mut size = record::encoded_len(1, 4, false);
+        for (key, put) in &writes {
+            size += record::encoded_len(key.len(), put.as_ref().map_or(0, |(v, _)| v.len()), put.is_some());
+        }
+        if size > inner.options.max_batch_bytes {
+            return Err(Error::BatchTooLarge { len: size, max: inner.options.max_batch_bytes });
+        }
+        let resolved: Vec<ResolvedOp<'_>> = writes
+            .iter()
+            .map(|(key, put)| (key.as_slice(), put.as_ref().map(|(v, at)| (v.as_slice(), *at))))
+            .collect();
+        inner.append_batch(&mut writer, resolved)?;
+        Ok(output)
     }
 
     /// Returns up to `limit` live entries whose keys fall in `range`, in key order.
@@ -604,6 +664,65 @@ impl Engine {
     }
 }
 
+/// The view handed to [`Engine::transaction`]. Reads see the transaction's
+/// own earlier writes; writes are buffered and applied atomically when the
+/// transaction function returns `Ok`.
+pub struct Transaction<'a> {
+    inner: &'a Inner,
+    now: u64,
+    /// Last write per key: `Some((value, expires_at))` or `None` for delete.
+    writes: BTreeMap<Vec<u8>, Option<(Vec<u8>, u64)>>,
+}
+
+impl Transaction<'_> {
+    /// The instant at which this transaction reads and resolves expiries.
+    pub fn now_ms(&self) -> u64 {
+        self.now
+    }
+
+    /// The live entry under `key`, including this transaction's own writes.
+    pub fn get(&self, key: &[u8]) -> Result<Option<Entry>> {
+        match self.writes.get(key) {
+            Some(Some((value, expires_at))) => {
+                Ok(Some(Entry { value: value.clone(), expires_at_ms: expiry_field(*expires_at) }))
+            }
+            Some(None) => Ok(None),
+            None => self.inner.read_entry_at(key, self.now),
+        }
+    }
+
+    /// Stores `value` under `key` when the transaction commits. An expiry
+    /// at or before [`now_ms`](Transaction::now_ms) makes this a delete.
+    pub fn put(&mut self, key: &[u8], value: &[u8], expiry: Expiry) -> Result<()> {
+        self.inner.validate(key, value)?;
+        let now = self.now;
+        let expires_at = match expiry {
+            Expiry::Never => NEVER,
+            Expiry::After(ttl) => now.saturating_add(u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX)),
+            Expiry::AtUnixMs(at) => at,
+            Expiry::KeepExisting => self.get(key)?.and_then(|e| e.expires_at_ms).unwrap_or(NEVER),
+        };
+        let write = (expires_at > now).then(|| (value.to_vec(), expires_at));
+        self.writes.insert(key.to_vec(), write);
+        Ok(())
+    }
+
+    /// Removes `key` when the transaction commits. Returns whether a live
+    /// value existed (as seen by this transaction).
+    pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
+        self.inner.validate(key, &[])?;
+        let existed = self.get(key)?.is_some();
+        self.writes.insert(key.to_vec(), None);
+        Ok(existed)
+    }
+}
+
+impl fmt::Debug for Transaction<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Transaction").field("now", &self.now).field("writes", &self.writes.len()).finish()
+    }
+}
+
 impl fmt::Debug for Engine {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Engine")
@@ -655,10 +774,19 @@ impl Inner {
     }
 
     fn read_entry(&self, key: &[u8]) -> Result<Option<Entry>> {
+        self.read_entry_if(key, |ptr| self.is_live(ptr))
+    }
+
+    /// Like `read_entry`, but judges expiry at a fixed instant.
+    fn read_entry_at(&self, key: &[u8], now: u64) -> Result<Option<Entry>> {
+        self.read_entry_if(key, |ptr| !ptr.is_expired(now))
+    }
+
+    fn read_entry_if(&self, key: &[u8], live: impl Fn(ValuePtr) -> bool) -> Result<Option<Entry>> {
         let located = {
             let index = self.index.read();
             match index.get(key) {
-                Some(&ptr) if self.is_live(ptr) => Some((ptr, self.reader(ptr.segment)?)),
+                Some(&ptr) if live(ptr) => Some((ptr, self.reader(ptr.segment)?)),
                 _ => None,
             }
         };
@@ -721,6 +849,32 @@ impl Inner {
                 Ok(true)
             }
         }
+    }
+
+    /// Writes `resolved` as one batch (members plus a commit record) in a
+    /// single append, then installs it under one index lock, so readers see
+    /// all of it or none of it.
+    fn append_batch(&self, writer: &mut Writer, resolved: Vec<ResolvedOp<'_>>) -> Result<()> {
+        let mut lens = Vec::with_capacity(resolved.len());
+        let (segment, base) = self.append(writer, |buf| {
+            for (key, put) in &resolved {
+                let spec = match put {
+                    Some((value, expires_at)) => Spec::put(key, value, expiry_field(*expires_at)),
+                    None => Spec::delete(key),
+                };
+                lens.push(record::append(buf, &spec.in_batch()) as u32);
+            }
+            record::append_commit(buf, resolved.len() as u32);
+        })?;
+
+        let mut index = self.index.write();
+        let mut offset = base;
+        for ((key, put), len) in resolved.into_iter().zip(lens) {
+            let ptr = put.map(|(_, expires_at)| ValuePtr { segment, offset, len, expires_at });
+            self.install(&mut index, key, ptr);
+            offset += u64::from(len);
+        }
+        Ok(())
     }
 
     /// Encodes records with `encode` and appends them in a single write,

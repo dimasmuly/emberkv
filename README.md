@@ -116,7 +116,7 @@ Two regressions appeared during v0.2 and were fixed before release. TTL support 
 ## Testing
 
 ```bash
-cargo test --workspace        # 77 tests
+cargo test --workspace        # 87 tests
 EMBERKV_SIM_SEEDS=5000 cargo test --release -p emberkv-raft --test simulation   # 5,000 cluster histories, ~10 s
 cd sdk/typescript && npm run typecheck && npm run example   # needs a running server
 ```
@@ -124,7 +124,8 @@ cd sdk/typescript && npm run typecheck && npm run example   # needs a running se
 | Kind | What it proves |
 |---|---|
 | **Deterministic cluster simulation** ([`simulation.rs`](crates/emberkv-raft/tests/simulation.rs)) | 3- and 5-node Raft clusters under message loss, duplication, reordering, partitions and crash-restart. Election safety, one vote per term, leader completeness, state machine safety, log matching and linearizable reads are checked after every step. Liveness is checked after healing. Every failure reproduces from its seed. **Mutation-tested**: 8 classic Raft bugs injected, 8 caught ([ADR-0010](docs/adr/0010-raft-consensus-core.md#evidence)). |
-| **Model-based property test** ([`model.rs`](crates/emberkv-engine/tests/model.rs)) | 128 random histories of put / TTL put / delete / batch / read-modify-write / time travel / purge / reopen / compact. Each is checked against a reference model on a `ManualClock`. Accounting rebuilt from disk must match the incremental accounting. |
+| **Replicas on real storage** ([`replica/tests.rs`](crates/emberkv-server/src/replica/tests.rs)) | 300 concurrent mixed writes leave every replica's keyspace byte-identical. Acknowledged writes survive a leader crash. A restarted replica applies nothing twice. A minority never acknowledges. |
+| **Model-based property test** ([`model.rs`](crates/emberkv-engine/tests/model.rs)) | 128 random histories of put / TTL put / delete / batch / read-modify-write / multi-key transaction (including aborts) / time travel / purge / reopen / compact. Each is checked against a reference model on a `ManualClock`. Accounting rebuilt from disk must match the incremental accounting. |
 | **Crash & corruption injection** ([`recovery.rs`](crates/emberkv-engine/tests/recovery.rs)) | Torn headers, torn bodies, **torn batches**, bit flips, bit rot at read time, stale compaction output, locking, checkpoint isolation, segment pruning |
 | **Concurrency stress** ([`concurrency.rs`](crates/emberkv-engine/tests/concurrency.rs)) | Writers, readers and a compactor looping concurrently. No torn or foreign values. The final state survives a reopen. |
 | **Protocol properties** ([`codec.rs`](crates/emberkv-protocol/tests/codec.rs)) | Round-trips under arbitrary TCP chunking, exact lengths, fuzzed input never panics |
@@ -146,6 +147,7 @@ cd sdk/typescript && npm run typecheck && npm run example   # needs a running se
 | [0008](docs/adr/0008-http-api-and-auth.md) | HTTP API design, namespaces, ETags, hashed API keys, secure defaults |
 | [0009](docs/adr/0009-checkpoints.md) | Hard-link checkpoints; never append to pre-existing segments |
 | [0010](docs/adr/0010-raft-consensus-core.md) | Own sans-IO Raft core, verified by deterministic simulation and mutation testing |
+| [0011](docs/adr/0011-replicated-state-machine.md) | Writes as deterministic commands on a replicated clock; the Raft log stored in emberkv itself; exactly-once apply |
 
 ## Used by
 
@@ -157,7 +159,7 @@ emberkv is a single-node system. The gaps below are known and documented on purp
 
 - [ ] **Group commit**: one fsync for many concurrent writers.
 - [ ] **TLS**: today, run it on a private network or behind a TLS-terminating proxy or service mesh ([INTEGRATION.md](docs/INTEGRATION.md#security-checklist)).
-- [ ] **Replication / HA**: in progress. The Raft core is done and verified ([ADR-0010](docs/adr/0010-raft-consensus-core.md)). Still to do: a replicated state machine and durable Raft log, node-to-node transport and leader forwarding, snapshots, then multi-endpoint failover in the SDK. Until then a single node is a single point of failure, and checkpoints give backups, not failover.
+- [ ] **Replication / HA**: in progress. Done: the Raft core ([ADR-0010](docs/adr/0010-raft-consensus-core.md)), and a replicated state machine with a durable Raft log, group commit and exactly-once apply ([ADR-0011](docs/adr/0011-replicated-state-machine.md)). Still to do: node-to-node transport and leader forwarding, snapshots, then multi-endpoint failover in the SDK. Until then a single node is a single point of failure, and checkpoints give backups, not failover.
 - [ ] **Hint files** for faster startup on large datasets.
 - [ ] All keys must fit in RAM (Bitcask trade-off, [ADR-0001](docs/adr/0001-log-structured-storage.md)).
 - [ ] Linux and macOS only (compaction relies on POSIX unlink-while-open).
