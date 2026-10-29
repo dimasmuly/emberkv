@@ -514,6 +514,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "emberkv-raft"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "emberkv-server"
 version = "0.1.0"
 dependencies = [

@@ -16,6 +16,7 @@ emberkv-engine = { path = "crates/emberkv-engine", version = "0.1.0" }
 emberkv-protocol = { path = "crates/emberkv-protocol", version = "0.1.0" }
 emberkv-client = { path = "crates/emberkv-client", version = "0.1.0" }
 emberkv-server = { path = "crates/emberkv-server", version = "0.1.0" }
+emberkv-raft = { path = "crates/emberkv-raft", version = "0.1.0" }
 
 anyhow = "1"
 axum = "0.8"
