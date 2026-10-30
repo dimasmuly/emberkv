@@ -1,5 +1,7 @@
 # Quickstart: emberkv in your app in 5 minutes
 
+*Bahasa Indonesia: [QUICKSTART.id.md](QUICKSTART.id.md)*
+
 emberkv runs as a separate service next to your backend. It needs no config file: one environment variable turns on authentication.
 
 ## 1. Run the server

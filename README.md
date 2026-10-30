@@ -27,7 +27,7 @@ const { allowed } = await kit.rateLimit.check(`login:${email}`, { limit: 5, wind
 const { result } = await kit.idempotency.once("payment", idempotencyKey, () => charge(order));
 ```
 
-**Use it in your own app in 5 minutes** with no config files: `docker run -e EMBERKV_ADMIN_TOKEN=… ghcr.io/dimasmuly/emberkv`, then `npm install @emberkv/client` or plain HTTP from any language. See [QUICKSTART.md](docs/QUICKSTART.md).
+**Use it in your own app in 5 minutes** with no config files: `docker run -e EMBERKV_ADMIN_TOKEN=… ghcr.io/dimasmuly/emberkv`, then `npm install @emberkv/client` or plain HTTP from any language. See [QUICKSTART.md](docs/QUICKSTART.md) (Bahasa Indonesia: [QUICKSTART.id.md](docs/QUICKSTART.id.md)).
 
 ---
 
