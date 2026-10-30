@@ -1,7 +1,7 @@
 {
   "name": "@emberkv/client",
-  "version": "0.2.0",
-  "description": "Zero-dependency TypeScript client for the emberkv HTTP API",
+  "version": "0.3.0",
+  "description": "Zero-dependency TypeScript client for emberkv, with ready-made sessions, rate limits, idempotency, leases and caching",
   "license": "MIT",
   "type": "module",
   "exports": "./src/index.ts",
@@ -10,10 +10,27 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "example": "node examples/app-backend.ts"
+    "example": "node examples/app-backend.ts",
+    "example:kit": "node examples/kit.ts",
+    "build:package": "node scripts/build-package.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
     "typescript": "^5.9.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dimasmuly/emberkv.git",
+    "directory": "sdk/typescript"
+  },
+  "homepage": "https://github.com/dimasmuly/emberkv/tree/main/sdk/typescript",
+  "keywords": [
+    "emberkv",
+    "key-value",
+    "sessions",
+    "rate-limit",
+    "idempotency",
+    "cache",
+    "lease"
+  ]
 }

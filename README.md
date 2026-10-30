@@ -20,11 +20,14 @@ curl -X POST localhost:8080/v1/namespaces/limits/rate-limits/login:user-42 \
 ```
 
 ```ts
-// From a Node.js / Deno / Bun backend
-const kv = new EmberKV({ baseUrl: "http://emberkv:8080", token: process.env.EMBERKV_TOKEN });
-const sessions = kv.namespace("sessions");
-await sessions.put(sessionId, { userId, device: "android" }, { ttl: "7d" });
+// From a Node.js / Deno / Bun backend: ready-made features, one object
+const kit = createKit({ baseUrl: "http://emberkv:8080", token: process.env.EMBERKV_TOKEN });
+const cookie = await kit.sessions.create(user.id, { device: "android" });
+const { allowed } = await kit.rateLimit.check(`login:${email}`, { limit: 5, window: "15m" });
+const { result } = await kit.idempotency.once("payment", idempotencyKey, () => charge(order));
 ```
+
+**Use it in your own app in 5 minutes** with no config files: `docker run -e EMBERKV_ADMIN_TOKEN=… ghcr.io/dimasmuly/emberkv`, then `npm install @emberkv/client` or plain HTTP from any language. See [QUICKSTART.md](docs/QUICKSTART.md).
 
 ---
 
@@ -68,9 +71,12 @@ await sessions.put(sessionId, { userId, device: "android" }, { ttl: "7d" });
 | **Backups** | Online checkpoints via hard links: consistent and nearly free, restored with a plain `open` | [ADR-0009](docs/adr/0009-checkpoints.md) |
 | **Crash safety** | CRC32 per record, torn-tail truncation, fatal on sealed-segment damage, fsync poisoning | [ADR-0003](docs/adr/0003-durability-and-recovery.md) |
 | **Online compaction** | Reclaims space under live traffic. Crash-safe at every step | [ADR-0004](docs/adr/0004-online-compaction.md) |
-| **Operations** | Prometheus metrics, JSON logs, `/healthz` + `/readyz`, graceful drain on SIGTERM, Docker | [INTEGRATION.md](docs/INTEGRATION.md) |
+| **Operations** | Prometheus metrics, JSON logs, `/healthz` + `/readyz`, graceful drain on SIGTERM. A multi-arch image (amd64 + arm64) is published to GHCR by CI. Zero-config auth via `EMBERKV_ADMIN_TOKEN` | [INTEGRATION.md](docs/INTEGRATION.md) |
+| **App kit (TypeScript)** | Sessions, rate limits, exactly-once requests, edit leases and a shared cache, each with a designed failure mode | [QUICKSTART.md](docs/QUICKSTART.md) |
 
 ## Quick start
+
+The fastest path, with Docker and no files, is in [QUICKSTART.md](docs/QUICKSTART.md). From source, with scoped API keys:
 
 ```bash
 # 1. Mint an API key for your backend (the token is shown once)

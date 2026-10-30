@@ -36,6 +36,11 @@ struct Cli {
     #[arg(long, env = "EMBERKV_AUTH_FILE")]
     auth_file: Option<PathBuf>,
 
+    /// Zero-config auth: accept this token (16+ characters) as an admin key,
+    /// alone or next to an auth file. Prefer scoped keys for multi-app setups.
+    #[arg(long, env = "EMBERKV_ADMIN_TOKEN", hide_env_values = true)]
+    admin_token: Option<Secret>,
+
     /// Allow listening on non-loopback addresses without authentication.
     /// Only for networks where every client is trusted.
     #[arg(long, env = "EMBERKV_ALLOW_UNAUTHENTICATED_REMOTE")]
@@ -98,6 +103,24 @@ struct Cli {
     log_format: LogFormat,
 }
 
+/// A command-line secret that never shows up in debug output or logs.
+#[derive(Clone)]
+struct Secret(String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl std::str::FromStr for Secret {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_owned()))
+    }
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SyncArg {
     Always,
@@ -107,7 +130,14 @@ enum SyncArg {
 
 impl Cli {
     fn into_config(self) -> anyhow::Result<ServerConfig> {
-        let auth = self.auth_file.as_deref().map(Authenticator::load).transpose()?.map(Arc::new);
+        let mut auth = self.auth_file.as_deref().map(Authenticator::load).transpose()?;
+        if let Some(Secret(token)) = &self.admin_token {
+            match &mut auth {
+                Some(auth) => auth.add_admin_token(token)?,
+                None => auth = Some(Authenticator::from_admin_token(token)?),
+            }
+        }
+        let auth = auth.map(Arc::new);
         Ok(ServerConfig {
             listen: self.listen,
             http_listen: (!self.disable_http).then_some(self.http_listen),

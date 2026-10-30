@@ -23,6 +23,8 @@ use sha2::{Digest, Sha256};
 
 use crate::keyspace;
 
+const ADMIN_TOKEN_NAME: &str = "admin-token";
+
 /// What a key may do. Ordered: each level includes the ones before it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,6 +140,36 @@ impl Authenticator {
         Ok(Self { by_hash })
     }
 
+    /// An authenticator with a single admin key, for zero-config deployments
+    /// (`EMBERKV_ADMIN_TOKEN`). Production setups with several apps should
+    /// prefer an auth file with one scoped key per app.
+    pub fn from_admin_token(token: &str) -> anyhow::Result<Self> {
+        let mut auth = Self { by_hash: HashMap::new() };
+        auth.add_admin_token(token)?;
+        Ok(auth)
+    }
+
+    /// Adds `token` as an admin key named `admin-token`, next to the keys
+    /// from an auth file.
+    pub fn add_admin_token(&mut self, token: &str) -> anyhow::Result<()> {
+        ensure!(token.len() >= 16, "the admin token must be at least 16 characters");
+        ensure!(!token.chars().any(char::is_whitespace), "the admin token must not contain whitespace");
+        ensure!(
+            !self.by_hash.values().any(|p| p.name == ADMIN_TOKEN_NAME),
+            "an auth-file key is already named {ADMIN_TOKEN_NAME:?}"
+        );
+        let principal = Arc::new(Principal {
+            name: ADMIN_TOKEN_NAME.to_owned(),
+            access: Access::Admin,
+            namespaces: Scope::All,
+        });
+        ensure!(
+            self.by_hash.insert(sha256(token.as_bytes()), principal).is_none(),
+            "the admin token is also used by an auth-file key"
+        );
+        Ok(())
+    }
+
     /// Returns the principal owning `token`, if any.
     pub fn authenticate(&self, token: &[u8]) -> Option<Arc<Principal>> {
         self.by_hash.get(&sha256(token)).cloned()
@@ -233,5 +265,24 @@ mod tests {
     fn debug_output_hides_hashes() {
         let auth = config(&entry("a", "secret", "read", "[\"*\"]")).unwrap();
         assert!(!format!("{auth:?}").contains(&hash_token("secret")));
+    }
+
+    #[test]
+    fn an_admin_token_works_alone_or_next_to_an_auth_file() {
+        let token = "zero-config-token-0123";
+        let auth = Authenticator::from_admin_token(token).unwrap();
+        let principal = auth.authenticate(token.as_bytes()).unwrap();
+        assert!(principal.is_admin() && principal.can("anything", Access::ReadWrite));
+        assert!(auth.authenticate(b"wrong").is_none());
+
+        let mut auth = config(&entry("app", "app-token-0123456", "read_write", "[\"sessions\"]")).unwrap();
+        auth.add_admin_token(token).unwrap();
+        assert!(auth.authenticate(token.as_bytes()).unwrap().is_admin());
+        assert!(!auth.authenticate(b"app-token-0123456").unwrap().is_admin());
+
+        assert!(Authenticator::from_admin_token("short").is_err());
+        assert!(Authenticator::from_admin_token("has a space in it!!").is_err());
+        let mut clash = config(&entry("app", token, "read", "[\"sessions\"]")).unwrap();
+        assert!(clash.add_admin_token(token).is_err(), "a token cannot be both scoped and admin");
     }
 }

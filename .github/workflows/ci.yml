@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 env:
@@ -62,12 +63,103 @@ jobs:
         run: |
           ./target/release/ekv token --name ci --namespaces sessions,otp,limits,idempotency,flags > key.txt
           sed -n '/^\[\[key\]\]/,$p' key.txt > auth.toml
-          ./target/release/emberkv-server --data-dir "$RUNNER_TEMP/data" --auth-file auth.toml &
+          # A scoped key from the auth file, plus a zero-config admin token.
+          EMBERKV_ADMIN_TOKEN=ci-admin-token-0123456789 \
+            ./target/release/emberkv-server --data-dir "$RUNNER_TEMP/data" --auth-file auth.toml &
           for i in $(seq 30); do curl -sf localhost:8080/readyz && break; sleep 0.2; done
-          cd sdk/typescript && EMBERKV_TOKEN=$(grep -o 'ekv_[0-9a-f]*' ../../key.txt) npm run example
+          cd sdk/typescript
+          EMBERKV_TOKEN=$(grep -o 'ekv_[0-9a-f]*' ../../key.txt) npm run example
+          EMBERKV_TOKEN=ci-admin-token-0123456789 npm run example:kit
 
   docker:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: docker build -t emberkv:ci .
+
+  # Publishes ghcr.io/dimasmuly/emberkv once everything above is green:
+  # `latest` and `sha-…` from main, `X.Y.Z` and `X.Y` from `vX.Y.Z` tags.
+  # Each architecture builds natively on its own runner (no QEMU), then the
+  # digests are merged into one multi-arch manifest.
+  image:
+    if: github.event_name == 'push'
+    needs: [lint, test, msrv, sdk, docker]
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+      - name: Record digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: mkdir -p digests && touch "digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ strategy.job-index }}
+          path: digests/*
+          retention-days: 1
+
+  publish:
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - name: Push the multi-arch manifest
+        working-directory: digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf 'ghcr.io/${{ github.repository }}@sha256:%s ' *)
+      - name: Smoke-test the published image with zero-config auth
+        env:
+          IMAGE: ${{ fromJSON(steps.meta.outputs.json).tags[0] }}
+        run: |
+          docker run -d --name emberkv -p 8080:8080 -e EMBERKV_ADMIN_TOKEN=smoke-test-token-0123 "$IMAGE"
+          for i in $(seq 60); do curl -sf localhost:8080/readyz && break; sleep 0.5; done
+          curl -sf -X PUT localhost:8080/v1/namespaces/smoke/keys/k -H 'Authorization: Bearer smoke-test-token-0123' -d '{"ok":true}'
+          test "$(curl -sf localhost:8080/v1/namespaces/smoke/keys/k -H 'Authorization: Bearer smoke-test-token-0123')" = '{"ok":true}'
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/v1/namespaces/smoke/keys/k)" = 401
